@@ -1,0 +1,150 @@
+import argparse
+import json
+import os
+import re
+import random
+from datasets import load_dataset
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    #parser.add_argument('--base-dir', type=str)
+    parser.add_argument('--result-file', type=str)
+    parser.add_argument('--output-file', type=str)
+    parser.add_argument('--output-result', type=str)
+    parser.add_argument('--split', type=str, default='test')
+    
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--topic', type=str, default='all')
+    parser.add_argument('--datasetname', type=str, default='scienceqa')
+    
+    parser.add_argument('--wb_pj_name', type=str, default='')
+    parser.add_argument('--wb_run_name', type=str, default='')
+    parser.add_argument('--options', type=list, default=["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K","L"])
+    return parser.parse_args()
+
+
+def convert_caps(results):
+    fakecaps = []
+    for result in results:
+        image_id = result['question_id']
+        caption = result['text']
+        fakecaps.append({"image_id": int(image_id), "caption": caption})
+    return fakecaps
+
+
+def get_pred_idx(prediction, choices, options):
+    """
+    Get the index (e.g. 2) from the prediction (e.g. 'C')
+    """
+    if prediction in options[:len(choices)]:
+        return options.index(prediction)
+    else:
+        return -1
+        return random.choice(range(len(choices)))
+
+
+if __name__ == "__main__":
+    args = get_args()
+
+    if args.wb_pj_name:
+        import wandb
+        wandb.init(
+        project=args.wb_pj_name,
+        name=args.wb_run_name if args.wb_run_name else None,
+        config=vars(args),)
+
+    
+    if args.datasetname == 'scienceqa':
+        problems = load_dataset("lmms-lab/ScienceQA", "ScienceQA-IMG", split="test")
+        # if args.topic != "all":
+        #     problems = problems.filter(lambda example: example["topic"] == args.topic)
+    # elif args.datasetname == 'mmmu':
+    #     if args.topic != 'all':
+    #         problems = load_dataset("MMMU/MMMU", args.topic, split="validation")
+    #     else:
+    #         problems = load_dataset("lmms-lab/MMMU", split="validation")
+    else:
+        raise ValueError
+
+    predictions = [json.loads(line) for line in open(args.result_file)]
+    predictions = {pred['question_id']: pred for pred in predictions}
+    # split_problems = {idx: problems[idx] for idx in split_indices}
+
+    results = {'correct': [], 'incorrect': []}
+    sqa_results = {}
+    sqa_results['acc'] = None
+    sqa_results['correct'] = None
+    sqa_results['count'] = None
+    sqa_results['results'] = {}
+    sqa_results['outputs'] = {}
+
+    opt_string = 'options' if args.datasetname == 'mmmu' else 'choices'
+    for prob_id, prob in enumerate(problems):
+        if prob_id not in predictions:
+            pred = {'text': 'FAILED', 'prompt': 'Unknown'}
+            pred_text = 'FAILED'
+        else:
+            pred = predictions[prob_id]
+            pred_text = pred['text']
+
+        if pred_text in args.options:
+            answer = pred_text
+        elif len(pred_text) >= 3 and pred_text[0] in args.options and pred_text[1:3] == ". ":
+            answer = pred_text[0]
+        else:
+            pattern = re.compile(r'The answer is ([A-Z]).')
+            res = pattern.findall(pred_text)
+            if len(res) == 1:
+                answer = res[0]  # 'A', 'B', ...
+            else:
+                answer = "FAILED"
+
+        pred_idx = get_pred_idx(answer, prob[opt_string], args.options)
+        
+
+        analysis = {
+            'question_id': prob_id,
+            'parsed_ans': answer,
+            'ground_truth': prob['answer'],
+            'question': pred['prompt'],
+            'pred': pred_text,
+            'is_multimodal': '<image>' in pred['prompt'],
+        }
+
+        sqa_results['results'][prob_id] = get_pred_idx(answer, prob[opt_string], args.options)
+        sqa_results['outputs'][prob_id] = pred_text
+
+        if args.datasetname == 'scienceqa':
+            if pred_idx == prob['answer']:
+                results['correct'].append(analysis)
+            else:
+                results['incorrect'].append(analysis)
+        # elif args.datasetname == 'mmmu':
+        #     if answer == prob['answer']:
+        #         results['correct'].append(analysis)
+        #     else:
+        #         results['incorrect'].append(analysis)
+        
+
+    correct = len(results['correct'])
+    total = len(results['correct']) + len(results['incorrect'])
+
+    
+    multimodal_correct = len([x for x in results['correct'] if x['is_multimodal']])
+    multimodal_incorrect = len([x for x in results['incorrect'] if x['is_multimodal']])
+    multimodal_total = multimodal_correct + multimodal_incorrect
+    
+
+    print(f'Total: {total}, Correct: {correct}, Accuracy: {correct / total * 100:.2f}%, IMG-Accuracy: {multimodal_correct / multimodal_total * 100:.2f}%')
+
+    sqa_results['acc'] = correct / total * 100
+    sqa_results['correct'] = correct
+    sqa_results['count'] = total
+    
+    if args.wb_pj_name:
+        wandb.log({'acc':sqa_results['acc'],'correct':sqa_results['correct'],'count':sqa_results['count']})
+        
+    with open(args.output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    with open(args.output_result, 'w') as f:
+        json.dump(sqa_results, f, indent=2)
